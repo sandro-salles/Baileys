@@ -17,3 +17,6 @@ export * from './process-message'
 export * from './message-retry-manager'
 export * from './browser-utils'
 export * from './identity-change-handler'
+
+export * from './offline-node-processor'
+export * from './stanza-ack'

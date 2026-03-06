@@ -51,6 +51,8 @@ import {
 	xmppSignedPreKey
 } from '../Utils'
 import { makeMutex } from '../Utils/make-mutex'
+import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
+import { buildAckStanza } from '../Utils/stanza-ack'
 import { isTcTokenExpired, resolveTcTokenJid, storeTcTokensFromIqResult } from '../Utils/tc-token-utils'
 import {
 	areJidsSameUser,
@@ -347,40 +349,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
-	const sendMessageAck = async ({ tag, attrs, content }: BinaryNode, errorCode?: number) => {
-		const stanza: BinaryNode = {
-			tag: 'ack',
-			attrs: {
-				id: attrs.id!,
-				to: attrs.from!,
-				class: tag
-			}
-		}
-
-		if (!!errorCode) {
-			stanza.attrs.error = errorCode.toString()
-		}
-
-		if (!!attrs.participant) {
-			stanza.attrs.participant = attrs.participant
-		}
-
-		if (!!attrs.recipient) {
-			stanza.attrs.recipient = attrs.recipient
-		}
-
-		if (
-			!!attrs.type &&
-			(tag !== 'message' || getBinaryNodeChild({ tag, attrs, content }, 'unavailable') || errorCode !== 0)
-		) {
-			stanza.attrs.type = attrs.type
-		}
-
-		if (tag === 'message' && getBinaryNodeChild({ tag, attrs, content }, 'unavailable')) {
-			stanza.attrs.from = authState.creds.me!.id
-		}
-
-		logger.debug({ recv: { tag, attrs }, sent: stanza.attrs }, 'sent ack')
+	const sendMessageAck = async (node: BinaryNode, errorCode?: number) => {
+		const stanza = buildAckStanza(node, errorCode, authState.creds.me!.id)
+		logger.debug({ recv: { tag: node.tag, attrs: node.attrs }, sent: stanza.attrs }, 'sent ack')
 		await sendNode(stanza)
 	}
 
@@ -1328,29 +1299,24 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		}
 
-		if (msg.key?.remoteJid && msg.key?.id && messageRetryManager) {
-			messageRetryManager.addRecentMessage(msg.key.remoteJid, msg.key.id, msg.message!)
-			logger.debug(
-				{
-					jid: msg.key.remoteJid,
-					id: msg.key.id
-				},
-				'Added message to recent cache for retry receipts'
-			)
-		}
+		let acked = false
 
 		try {
 			await messageMutex.mutex(async () => {
 				await decrypt()
+
+				if (msg.key?.remoteJid && msg.key?.id && msg.message && messageRetryManager) {
+					messageRetryManager.addRecentMessage(msg.key.remoteJid, msg.key.id, msg.message)
+				}
+
 				// message failed to decrypt
 				if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT && msg.category !== 'peer') {
 					if (msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT) {
+						acked = true
 						return sendMessageAck(node, NACK_REASONS.ParsingError)
 					}
 
 					if (msg.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
-						// Message arrived without encryption (e.g. CTWA ads messages).
-						// Check if this is eligible for placeholder resend (matching WA Web filters).
 						const unavailableNode = getBinaryNodeChild(node, 'unavailable')
 						const unavailableType = unavailableNode?.attrs?.type
 						if (
@@ -1362,27 +1328,23 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								{ msgId: msg.key.id, unavailableType },
 								'skipping placeholder resend for excluded unavailable type'
 							)
+							acked = true
 							return sendMessageAck(node)
 						}
 
 						const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp)
 						if (messageAge > PLACEHOLDER_MAX_AGE_SECONDS) {
 							logger.debug({ msgId: msg.key.id, messageAge }, 'skipping placeholder resend for old message')
+							acked = true
 							return sendMessageAck(node)
 						}
 
-						// Request the real content from the phone via placeholder resend PDO.
-						// Upsert the CIPHERTEXT stub as a placeholder (like WA Web's processPlaceholderMsg),
-						// and store the requestId in stubParameters[1] so users can correlate
-						// with the incoming PDO response event.
 						const cleanKey: proto.IMessageKey = {
 							remoteJid: msg.key.remoteJid,
 							fromMe: msg.key.fromMe,
 							id: msg.key.id,
 							participant: msg.key.participant
 						}
-						// Cache the original message metadata so the PDO response handler
-						// can preserve key fields (LID details etc.) that the phone may omit
 						const msgData: Partial<WAMessage> = {
 							key: msg.key,
 							messageTimestamp: msg.messageTimestamp,
@@ -1405,10 +1367,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							.catch(err => {
 								logger.warn({ err, msgId: msg.key.id }, 'failed to request placeholder resend for unavailable message')
 							})
+						acked = true
 						await sendMessageAck(node)
-						// Don't return — fall through to upsertMessage so the stub is emitted
 					} else {
-						// Skip retry for expired status messages (>24h old)
 						if (isJidStatusBroadcast(msg.key.remoteJid!)) {
 							const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp)
 							if (messageAge > STATUS_EXPIRY_SECONDS) {
@@ -1416,6 +1377,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 									{ msgId: msg.key.id, messageAge, remoteJid: msg.key.remoteJid },
 									'skipping retry for expired status message'
 								)
+								acked = true
 								return sendMessageAck(node)
 							}
 						}
@@ -1425,7 +1387,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 						logger.debug(`[handleMessage] Attempting retry request for failed decryption`)
 
-						// Handle both pre-key and normal retries in single mutex
 						await retryMutex.mutex(async () => {
 							try {
 								if (!ws.isOpen) {
@@ -1433,7 +1394,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 									return
 								}
 
-								// Handle pre-key errors with upload and delay
 								if (isPreKeyError) {
 									logger.info({ error: errorMessage }, 'PreKey error detected, uploading and retrying')
 
@@ -1454,7 +1414,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								}
 							} catch (err) {
 								logger.error({ err, isPreKeyError }, 'Failed to handle retry, attempting basic retry')
-								// Still attempt retry even if pre-key upload failed
 								try {
 									const encNode = getBinaryNodeChild(node, 'enc')
 									await sendRetryRequest(node, !encNode)
@@ -1463,6 +1422,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								}
 							}
 
+							acked = true
 							await sendMessageAck(node, NACK_REASONS.UnhandledError)
 						})
 					}
@@ -1473,32 +1433,29 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 					const isNewsletter = isJidNewsletter(msg.key.remoteJid!)
 					if (!isNewsletter) {
-						// no type in the receipt => message delivered
 						let type: MessageReceiptType = undefined
 						let participant = msg.key.participant
 						if (category === 'peer') {
-							// special peer message
 							type = 'peer_msg'
 						} else if (msg.key.fromMe) {
-							// message was sent by us from a different device
 							type = 'sender'
-							// need to specially handle this case
 							if (isLidUser(msg.key.remoteJid!) || isLidUser(msg.key.remoteJidAlt)) {
-								participant = author // TODO: investigate sending receipts to LIDs and not PNs
+								participant = author
 							}
 						} else if (!sendActiveReceipts) {
 							type = 'inactive'
 						}
 
+						acked = true
 						await sendReceipt(msg.key.remoteJid!, participant!, [msg.key.id!], type)
 
-						// send ack for history message
 						const isAnyHistoryMsg = getHistoryMsg(msg.message!)
 						if (isAnyHistoryMsg) {
 							const jid = jidNormalizedUser(msg.key.remoteJid!)
-							await sendReceipt(jid, undefined, [msg.key.id!], 'hist_sync') // TODO: investigate
+							await sendReceipt(jid, undefined, [msg.key.id!], 'hist_sync')
 						}
 					} else {
+						acked = true
 						await sendMessageAck(node)
 						logger.debug({ key: msg.key }, 'processed newsletter message without receipts')
 					}
@@ -1510,6 +1467,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			})
 		} catch (error) {
 			logger.error({ error, node: binaryNodeToString(node) }, 'error in handling message')
+			if (!acked) {
+				await sendMessageAck(node, NACK_REASONS.UnhandledError).catch(ackErr =>
+					logger.error({ ackErr }, 'failed to ack message after error')
+				)
+			}
 		}
 	}
 
@@ -1654,74 +1616,19 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
-	type MessageType = 'message' | 'call' | 'receipt' | 'notification'
-
-	type OfflineNode = {
-		type: MessageType
-		node: BinaryNode
-	}
-
-	/** Yields control to the event loop to prevent blocking */
-	const yieldToEventLoop = (): Promise<void> => {
-		return new Promise(resolve => setImmediate(resolve))
-	}
-
-	const makeOfflineNodeProcessor = () => {
-		const nodeProcessorMap: Map<MessageType, (node: BinaryNode) => Promise<void>> = new Map([
+	const offlineNodeProcessor = makeOfflineNodeProcessor(
+		new Map<MessageType, (node: BinaryNode) => Promise<void>>([
 			['message', handleMessage],
 			['call', handleCall],
 			['receipt', handleReceipt],
 			['notification', handleNotification]
-		])
-		const nodes: OfflineNode[] = []
-		let isProcessing = false
-
-		// Number of nodes to process before yielding to event loop
-		const BATCH_SIZE = 10
-
-		const enqueue = (type: MessageType, node: BinaryNode) => {
-			nodes.push({ type, node })
-
-			if (isProcessing) {
-				return
-			}
-
-			isProcessing = true
-
-			const promise = async () => {
-				let processedInBatch = 0
-
-				while (nodes.length && ws.isOpen) {
-					const { type, node } = nodes.shift()!
-
-					const nodeProcessor = nodeProcessorMap.get(type)
-
-					if (!nodeProcessor) {
-						onUnexpectedError(new Error(`unknown offline node type: ${type}`), 'processing offline node')
-						continue
-					}
-
-					await nodeProcessor(node)
-					processedInBatch++
-
-					// Yield to event loop after processing a batch
-					// This prevents blocking the event loop for too long when there are many offline nodes
-					if (processedInBatch >= BATCH_SIZE) {
-						processedInBatch = 0
-						await yieldToEventLoop()
-					}
-				}
-
-				isProcessing = false
-			}
-
-			promise().catch(error => onUnexpectedError(error, 'processing offline nodes'))
+		]),
+		{
+			isWsOpen: () => ws.isOpen,
+			onUnexpectedError,
+			yieldToEventLoop: () => new Promise(resolve => setImmediate(resolve))
 		}
-
-		return { enqueue }
-	}
-
-	const offlineNodeProcessor = makeOfflineNodeProcessor()
+	)
 
 	const processNode = async (
 		type: MessageType,
