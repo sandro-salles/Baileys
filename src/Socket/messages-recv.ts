@@ -76,7 +76,7 @@ import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
-	const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid, enableAutoSessionRecreation } =
+	const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid, enableAutoSessionRecreation, ignoreStatusBroadcast } =
 		config
 	const sock = makeMessagesSocket(config)
 	const {
@@ -1152,6 +1152,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			return
 		}
 
+		if (ignoreStatusBroadcast && isJidStatusBroadcast(remoteJid!)) {
+			logger.debug({ remoteJid }, 'ignored status broadcast receipt')
+			await sendMessageAck(node)
+			return
+		}
+
 		const ids = [attrs.id!]
 		if (Array.isArray(content)) {
 			const items = getBinaryNodeChildren(content[0], 'item')
@@ -1232,6 +1238,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			return
 		}
 
+		if (ignoreStatusBroadcast && isJidStatusBroadcast(remoteJid!)) {
+			logger.debug({ remoteJid }, 'ignored status broadcast notification')
+			await sendMessageAck(node)
+			return
+		}
+
 		try {
 			await Promise.all([
 				notificationMutex.mutex(async () => {
@@ -1265,6 +1277,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		if (shouldIgnoreJid(node.attrs.from!) && node.attrs.from !== S_WHATSAPP_NET) {
 			logger.debug({ key: node.attrs.key }, 'ignored message')
 			await sendMessageAck(node, NACK_REASONS.UnhandledError)
+			return
+		}
+
+		if (ignoreStatusBroadcast && isJidStatusBroadcast(node.attrs.from!)) {
+			logger.debug({ key: node.attrs.key }, 'ignored status broadcast message')
+			await sendMessageAck(node)
 			return
 		}
 
