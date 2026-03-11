@@ -1573,11 +1573,43 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					tcTokenRetriedMsgIds.add(msgId)
 					setTimeout(() => tcTokenRetriedMsgIds.delete(msgId), 60_000)
 
-					const msg =
-						(await getMessage(key)) ??
-						// Fallback to retry manager cache — the user's getMessage store
-						// may not have persisted the message yet (ack arrives <30ms after send)
-						messageRetryManager?.getRecentMessage(jid, msgId)?.message
+					const storedMessage = await getMessage(key)
+					const recentMessage = messageRetryManager?.getRecentMessage(jid, msgId)
+					const retrySource = storedMessage ? 'getMessage' : recentMessage?.message ? 'recentMessageCache' : 'none'
+					const msg = storedMessage ?? recentMessage?.message
+
+					let tcTokenJid = jid
+					let hasStoredToken = false
+					let tcTokenTimestamp: number | null = null
+					let tcTokenSenderTimestamp: number | null = null
+					let tcTokenLookupError: string | undefined
+
+					try {
+						tcTokenJid = await resolveTcTokenJid(jid, getLIDForPN)
+						const tcTokenData = await authState.keys.get('tctoken', [tcTokenJid])
+						const tcTokenEntry = tcTokenData?.[tcTokenJid]
+						hasStoredToken = Boolean(tcTokenEntry?.token?.length)
+						tcTokenTimestamp = tcTokenEntry?.timestamp ? Number(tcTokenEntry.timestamp) : null
+						tcTokenSenderTimestamp = tcTokenEntry?.senderTimestamp ? Number(tcTokenEntry.senderTimestamp) : null
+					} catch (tokenLookupErr: any) {
+						tcTokenLookupError = tokenLookupErr?.message || 'unknown tctoken lookup error'
+					}
+
+					const missingTcTokenDiagnostics = {
+						msgId,
+						from: jid,
+						rawFrom: attrs.from,
+						ackError: attrs.error,
+						tcTokenJid,
+						hasStoredToken,
+						tcTokenTimestamp,
+						tcTokenSenderTimestamp,
+						tcTokenLookupError,
+						foundInStore: Boolean(storedMessage),
+						foundInRecentCache: Boolean(recentMessage?.message),
+						retrySource
+					}
+
 					if (msg) {
 						//eslint-disable-next-line max-depth
 						try {
@@ -1589,13 +1621,38 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							logger.info({ msgId, from: jid }, 'error 463 retry succeeded')
 							return
 						} catch (retryErr: any) {
-							logger.warn({ msgId, err: retryErr?.message }, 'error 463 retry failed')
+							logger.error(
+								{
+									...missingTcTokenDiagnostics,
+									retryAttempted: true,
+									retryDelayMs: 1500,
+									retryError: retryErr?.message,
+									stack: retryErr?.stack
+								},
+								'ack error 463: retry failed, emitting messages.update ERROR'
+							)
 						}
 					} else {
-						logger.warn({ msgId, from: jid }, 'error 463: no message found for retry')
+						logger.error(
+							{
+								...missingTcTokenDiagnostics,
+								retryAttempted: false
+							},
+							'ack error 463: message not found in store or recent cache, emitting messages.update ERROR'
+						)
 					}
 				} else if (msgId && tcTokenRetriedMsgIds.has(msgId)) {
-					logger.warn({ msgId, from: jid }, 'error 463: already retried, giving up')
+					logger.error(
+						{
+							msgId,
+							from: jid,
+							rawFrom: attrs.from,
+							ackError: attrs.error,
+							retryAttempted: true,
+							alreadyRetried: true
+						},
+						'ack error 463: already retried, giving up and emitting messages.update ERROR'
+					)
 				}
 			} else if (attrs.error === SERVER_ERROR_CODES.SmaxInvalid) {
 				logger.warn(
